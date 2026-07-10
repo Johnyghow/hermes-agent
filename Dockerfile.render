@@ -12,9 +12,21 @@ COPY . /app
 # 安装 Hermes Agent
 RUN pip install --no-cache-dir -e .
 
-# 【Discord 专用启动脚本】
-# 逻辑：自动生成含有 Discord 凭证的 config.yaml
+# 【全自动记忆挂载与进化环境启动脚本】
 RUN echo '#!/bin/bash' > /app/start.sh && \
+    # 1. 容错式挂载：清理旧残留，确保每次拉取最新记忆库
+    echo 'echo "正在挂载 agent-mind 记忆库..."' >> /app/start.sh && \
+    echo 'rm -rf /app/mind' >> /app/start.sh && \
+    echo 'git clone https://x-access-token:${GITHUB_TOKEN}@github.com/johnyghow/agent-mind.git /app/mind' >> /app/start.sh && \
+    # 2. 【关键补漏】：赋予 Agent 提交代码的 Git 身份，否则无法保存记忆
+    echo 'git config --global user.email "hermes-agent@bot.local"' >> /app/start.sh && \
+    echo 'git config --global user.name "Hermes Agent"' >> /app/start.sh && \
+    # 3. 【关键补漏】：如果仓库是空的，自动建好分类目录，防止 Hermes 寻址崩溃
+    echo 'mkdir -p /app/mind/skills /app/mind/memory /app/mind/tasks' >> /app/start.sh && \
+    # 4. 环境变量：将 Hermes 的触角伸进 GitHub 仓库
+    echo 'export HERMES_SKILL_PATH=/app/mind/skills' >> /app/start.sh && \
+    echo 'export HERMES_MEMORY_PATH=/app/mind/memory' >> /app/start.sh && \
+    # 5. 动态注入配置文件 (Discord + 大模型配置)
     echo 'mkdir -p ~/.hermes' >> /app/start.sh && \
     echo 'cat <<EOF > ~/.hermes/config.yaml' >> /app/start.sh && \
     echo 'llm:' >> /app/start.sh && \
@@ -28,6 +40,7 @@ RUN echo '#!/bin/bash' > /app/start.sh && \
     echo 'EOF' >> /app/start.sh && \
     echo 'export OPENAI_API_KEY="${AGNES_API_KEY}"' >> /app/start.sh && \
     echo 'export OPENAI_API_BASE="https://apihub.agnes-ai.com/v1"' >> /app/start.sh && \
+    # 6. 启动伪装心跳与主网关
     echo 'python3 -m http.server ${PORT:-10000} &' >> /app/start.sh && \
     echo 'hermes gateway run' >> /app/start.sh && \
     chmod +x /app/start.sh

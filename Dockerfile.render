@@ -3,7 +3,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # 安装 Git 和系统依赖
-RUN apt-get update && apt-get install -y git && \
+# 修改为（加入了 ffmpeg 和 libopus0）：
+RUN apt-get update && apt-get install -y git ffmpeg libopus0 && \
     echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
 
 # 复制当前目录文件

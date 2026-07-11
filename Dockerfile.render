@@ -1,5 +1,5 @@
 # 使用轻量级 Python 运行环境
-FROM python:3.11-slim
+FROM python:3.13
 WORKDIR /app
 
 # 安装 Git 和系统依赖

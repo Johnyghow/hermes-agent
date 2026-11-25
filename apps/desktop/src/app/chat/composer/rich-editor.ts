@@ -15,7 +15,7 @@ import {
   type SlashChipKind,
   slashIconElement
 } from '@/components/assistant-ui/directive-text'
-import { referenceKind, referenceRe } from '@/components/assistant-ui/reference-kinds'
+import { referenceKind, referenceRe, unwrapReferenceValue } from '@/components/assistant-ui/reference-kinds'
 
 import { slashCommandMatches, type SlashCommandScanOptions } from './slash-refs'
 
@@ -106,11 +106,7 @@ export function escapeHtml(value: string) {
 }
 
 export function unquoteRef(raw: string) {
-  const head = raw[0]
-  const tail = raw[raw.length - 1]
-  const quoted = (head === '`' && tail === '`') || (head === '"' && tail === '"') || (head === "'" && tail === "'")
-
-  return quoted ? raw.slice(1, -1) : raw.replace(/[,.;!?]+$/, '')
+  return unwrapReferenceValue(raw)
 }
 
 /** Always-quote variant of formatRefValue — chips need a fence even for safe values. */
@@ -264,24 +260,71 @@ function composerSelectionRange(editor: HTMLElement) {
  *  makes a chip edge read as a token boundary, which is what both trigger
  *  detection and directive recognition need. */
 export function serializeTextBefore(editor: HTMLElement, container: Node, offset: number): string {
+  // Read the prefix in place. Cloning the range and rewriting chips/BRs in the
+  // clone was ~O(prefix) allocation plus a live-DOM write per keystroke; on a
+  // long accumulated draft it dominated the completion-trigger path. The
+  // traversal below produces the same string for every caret Chromium places:
+  // a chip contributes one U+FFFC regardless of where the caret sits inside it,
+  // a <br> contributes one newline, and text contributes its UTF-16 prefix. A
+  // (chip|br element, offset 0) boundary, which no caret path produces, now
+  // yields the prefix before that element instead of including it.
   const probe = document.createRange()
 
   probe.selectNodeContents(editor)
   probe.setEnd(container, offset)
 
-  const scratch = document.createElement('div')
+  let text = ''
 
-  scratch.append(probe.cloneContents())
+  const walk = (node: Node) => {
+    // The caret at this node's start includes none of it (a chip/BR element
+    // container would otherwise be emitted by the branches below).
+    if (node === container && offset === 0) {
+      return
+    }
 
-  for (const chip of scratch.querySelectorAll('[data-ref-text]')) {
-    chip.replaceWith('\uFFFC')
+    if (node.nodeType === Node.TEXT_NODE) {
+      text += node === container ? (node as Text).data.slice(0, offset) : ((node as Text).data ?? '')
+
+      return
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return
+    }
+
+    const element = node as Element
+
+    if (element.hasAttribute('data-ref-text')) {
+      text += '\uFFFC'
+
+      return
+    }
+
+    if (element.tagName === 'BR') {
+      text += '\n'
+
+      return
+    }
+
+    const children = element.childNodes
+    const limit = element === container ? offset : children.length
+
+    for (let index = 0; index < limit; index += 1) {
+      const child = children[index]
+
+      // A sibling that starts at/after the range end contributes nothing. The
+      // range boundary is already set, so this is a pure comparison — no clone.
+      if (element !== container && probe.comparePoint(child, 0) > 0) {
+        break
+      }
+
+      walk(child)
+    }
   }
 
-  for (const br of scratch.querySelectorAll('br')) {
-    br.replaceWith('\n')
-  }
+  walk(editor)
 
-  return scratch.textContent ?? ''
+  return text
 }
 
 /** True when the insertion point starts a token — the editor's start, or after
@@ -359,6 +402,8 @@ export function insertComposerContentsAtCaret(editor: HTMLElement, text: string,
     selection?.removeAllRanges()
     selection?.addRange(caret)
   }
+
+  revealCaret(editor)
 }
 
 /** Range covering exactly `length` serialized characters immediately before a
@@ -606,6 +651,93 @@ export function placeCaretEnd(element: HTMLElement) {
   range.collapse(false)
   selection?.removeAllRanges()
   selection?.addRange(range)
+  revealCaret(element)
+}
+
+/** The editor `scrollTop` that brings a caret spanning `caret.top..bottom`
+ *  (client px) inside the visible band `viewport`, or null when it's already
+ *  visible. Moves the nearest edge only, like `block: 'nearest'`. */
+export function caretRevealScrollTop(
+  caret: { bottom: number; top: number },
+  viewport: { bottom: number; top: number },
+  scrollTop: number
+): number | null {
+  if (caret.top < viewport.top) {
+    return scrollTop - (viewport.top - caret.top)
+  }
+
+  if (caret.bottom > viewport.bottom) {
+    return scrollTop + (caret.bottom - viewport.bottom)
+  }
+
+  return null
+}
+
+function caretClientRect(range: Range): { bottom: number; top: number } | null {
+  const end = range.cloneRange()
+  end.collapse(false)
+
+  const rects = typeof end.getClientRects === 'function' ? end.getClientRects() : null
+
+  if (rects?.length) {
+    return rects[rects.length - 1]
+  }
+
+  // Chromium gives a caret between elements (after a chip or <br>, or at the
+  // editor's end, which is where inserts leave it) no box. Measure a probe
+  // there instead. A text-node caret always has a box, so the probe never
+  // splits text.
+  if (end.startContainer.nodeType === Node.TEXT_NODE) {
+    return null
+  }
+
+  const probe = document.createElement('span')
+  probe.textContent = '\u200b'
+  end.insertNode(probe)
+
+  const rect = probe.getBoundingClientRect()
+
+  probe.remove()
+
+  return rect
+}
+
+const pendingReveals = new WeakSet<HTMLElement>()
+
+/** Scroll the editor so its caret is visible, on the next frame (one per
+ *  frame across a burst of inserts). Chromium only does this itself for native
+ *  edit commands; programmatic inserts (paste, voice transcripts, repaints)
+ *  leave the caret wherever the old scroll position puts it (#79806). Local to
+ *  the editor: `scrollIntoView` would also move the transcript. */
+export function revealCaret(editor: HTMLElement) {
+  if (pendingReveals.has(editor)) {
+    return
+  }
+
+  pendingReveals.add(editor)
+  window.requestAnimationFrame(() => {
+    pendingReveals.delete(editor)
+
+    const selection = window.getSelection()
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null
+
+    if (!editor.isConnected || !range || !editor.contains(range.endContainer)) {
+      return
+    }
+
+    const caret = caretClientRect(range)
+
+    if (!caret) {
+      return
+    }
+
+    const top = editor.getBoundingClientRect().top + editor.clientTop
+    const next = caretRevealScrollTop(caret, { bottom: top + editor.clientHeight, top }, editor.scrollTop)
+
+    if (next !== null) {
+      editor.scrollTop = next
+    }
+  })
 }
 
 /** The caret's offset in `composerPlainText` coordinates, so it can be restored

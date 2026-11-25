@@ -2,12 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { clearAllPrompts, sessionApprovalRequests, setApprovalRequest } from '@/store/prompts'
 import {
   $activeSessionId,
+  $currentBranch,
   $currentCwd,
   $selectedStoredSessionId,
   $workspaceCwdOwner,
   releaseWorkspaceCwdOwner,
+  setCurrentBranch,
   setCurrentCwd
 } from '@/store/session'
 
@@ -19,11 +22,13 @@ import type { GatewayEventContext } from './types'
 // still carries a real cwd.
 function sessionInfoEvent({
   activeSessionId,
+  branch,
   cwd,
   explicitSid = '',
   storedSessionId = ''
 }: {
   activeSessionId: null | string
+  branch?: string
   cwd: string
   explicitSid?: string
   storedSessionId?: string
@@ -49,7 +54,7 @@ function sessionInfoEvent({
     fromActiveSource: () => true,
     isActiveEvent: !!sessionId && sessionId === activeSessionId,
     occurredAt: Date.now() / 1000,
-    payload: { cwd, stored_session_id: storedSessionId },
+    payload: { branch, cwd, stored_session_id: storedSessionId },
     scheduleConfigRefresh: vi.fn(),
     sessionId
   } as unknown as GatewayEventContext
@@ -60,12 +65,14 @@ describe('handleSessionInfoEvent workspace ownership', () => {
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
+    setCurrentBranch('')
   })
 
   afterEach(() => {
     $selectedStoredSessionId.set(null)
     $workspaceCwdOwner.set(null)
     setCurrentCwd('')
+    setCurrentBranch('')
   })
 
   // #55831 / the "workspace pane visible with no agent selected" report: with
@@ -107,6 +114,43 @@ describe('handleSessionInfoEvent workspace ownership', () => {
 
     expect($currentCwd.get()).toBe('/repo/mine')
     expect($workspaceCwdOwner.get()).toBe('selected-session')
+  })
+
+  // #92888: a background Kanban worker's runtime update reaches the pane's
+  // active-runtime path while the default Bot Chat stays selected. It names the
+  // worker's own stored session and its PR worktree; neither the path nor the
+  // branch may move onto the composer, while the selected chat's own update
+  // still publishes both.
+  it("keeps another session's worktree cwd and branch off the selected chat's composer", () => {
+    $selectedStoredSessionId.set('default-bot-chat')
+    setCurrentCwd('/repo/main-checkout')
+    setCurrentBranch('main')
+
+    handleSessionInfoEvent(
+      sessionInfoEvent({
+        activeSessionId: 'runtime-1',
+        branch: 'kanban/pr-42',
+        cwd: '/repo/.worktrees/pr-42',
+        explicitSid: 'runtime-1',
+        storedSessionId: 'kanban-worker'
+      })
+    )
+
+    expect($currentCwd.get()).toBe('/repo/main-checkout')
+    expect($currentBranch.get()).toBe('main')
+
+    handleSessionInfoEvent(
+      sessionInfoEvent({
+        activeSessionId: 'runtime-1',
+        branch: 'feature/mine',
+        cwd: '/repo/main-checkout',
+        explicitSid: 'runtime-1',
+        storedSessionId: 'default-bot-chat'
+      })
+    )
+
+    expect($currentBranch.get()).toBe('feature/mine')
+    expect($workspaceCwdOwner.get()).toBe('default-bot-chat')
   })
 
   it('keeps runtime state identity when a heartbeat only restates cached fields', () => {
@@ -218,5 +262,52 @@ describe('handleSessionInfoEvent rebuilt-runtime re-bind', () => {
 
     expect($activeSessionId.get()).toBe('runtime-old')
     expect(ctx.deps.activeSessionIdRef.current).toBe('runtime-old')
+  })
+})
+
+describe('handleSessionInfoEvent turn end and open approvals', () => {
+  afterEach(() => {
+    clearAllPrompts()
+  })
+
+  it('keeps folder and site cards open when a live turn reports running=false, and drops command approvals', () => {
+    // The card's sender waits on a folder or site card, so the end of the turn does not close it.
+    const ctx = sessionInfoEvent({
+      activeSessionId: 'runtime-1',
+      cwd: '/repo/mine',
+      explicitSid: 'runtime-1',
+      storedSessionId: 'stored-1'
+    })
+
+    ctx.payload = { ...ctx.payload, running: false }
+    ctx.deps.sessionStateByRuntimeIdRef.current.set('runtime-1', {
+      ...createClientSessionState('stored-1'),
+      busy: true
+    })
+    setApprovalRequest({ command: 'rm -rf build', description: 'd', requestId: 'cmd', sessionId: 'runtime-1' })
+    setApprovalRequest({
+      command: '',
+      description: 'Allow C:\\docs',
+      kind: 'access',
+      requestId: 'folder',
+      sessionId: 'runtime-1',
+      target: { access: 'read', path: 'C:\\docs' }
+    })
+    setApprovalRequest({
+      command: '',
+      description: 'Allow the sandbox to reach pypi.org',
+      kind: 'network',
+      requestId: 'site',
+      sessionId: 'runtime-1',
+      target: { host: 'pypi.org' }
+    })
+
+    handleSessionInfoEvent(ctx)
+
+    expect(
+      sessionApprovalRequests('runtime-1')
+        .get()
+        .map(request => request.requestId)
+    ).toEqual(['folder', 'site'])
   })
 })
